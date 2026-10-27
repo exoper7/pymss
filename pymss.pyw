@@ -881,6 +881,7 @@ class LogWindow(QWidget):
         layout.addWidget(self.text)
 
         self.info_label = QLabel()
+        self.info_label.setStyleSheet(f"background-color: {ACCENT_DARK}; color: white; padding: 3px 6px;")
         layout.addWidget(self.info_label)
         self.update_info()
 
@@ -1099,9 +1100,53 @@ class RegisterDefDialog(QDialog):
         self.accept()
 
 
+# --- Akcent kolorystyczny (odróżnia pymss od pymms przy pracy obok siebie) ---
+
+ACCENT_DARK = "#1F2D3D"   # granat - nagłówki tabel, pasek statusu
+ACCENT = "#1E6FD0"        # niebieski - zaznaczenie, ramki, tytuły sekcji
+STATUS_COLORS = {"red": "#FF8A80", "green": "#8EE08E", "orange": "#FFC266"} # czytelne na granatowym pasku
+
+ACCENT_STYLESHEET = f"""
+QGroupBox {{
+    border: 1px solid {ACCENT};
+    border-radius: 4px;
+    margin-top: 10px;
+    padding-top: 6px;
+}}
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 8px;
+    padding: 0 4px;
+    color: {ACCENT};
+    font-weight: bold;
+}}
+QHeaderView::section {{
+    background-color: {ACCENT_DARK};
+    color: white;
+    font-weight: bold;
+    padding: 4px;
+    border: none;
+    border-right: 1px solid #3A4B5E;
+}}
+QTableWidget {{
+    gridline-color: #D0D7E0;
+    selection-background-color: {ACCENT};
+    selection-color: white;
+}}
+QStatusBar {{
+    background-color: {ACCENT_DARK};
+    color: white;
+}}
+QStatusBar QLabel {{
+    color: white;
+}}
+"""
+
+
 class ModbusSlaveApp(QMainWindow):
     # Wersja aplikacji, która będzie inkrementowana
-    __version__ = "1.01"
+    __version__ = "1.02"
 
     # Kolumny tabeli rejestrów
     COL_TABLE, COL_ADDR, COL_ADDR_HEX, COL_TYPE, COL_ORDER, COL_RAW, COL_VALUE, COL_DESC = range(8)
@@ -1109,6 +1154,7 @@ class ModbusSlaveApp(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        QApplication.instance().setStyleSheet(ACCENT_STYLESHEET) # obejmuje też okno logów i dialogi
         self.setWindowTitle(f"pymss (Python Modbus Slave Simulator) v{self.__version__}")
         self.setGeometry(100, 100, 1050, 700) # x, y, width, height
 
@@ -1344,7 +1390,7 @@ class ModbusSlaveApp(QMainWindow):
 
     def set_status(self, text, color=""):
         self.status_message_label.setText(text)
-        self.status_message_label.setStyleSheet(f"color: {color};" if color else "")
+        self.status_message_label.setStyleSheet(f"color: {STATUS_COLORS.get(color, color)};" if color else "")
 
     def update_server_buttons(self):
         running = self.server is not None
