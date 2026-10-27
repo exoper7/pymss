@@ -1102,7 +1102,8 @@ class RegisterDefDialog(QDialog):
 
 # --- Akcent kolorystyczny (odróżnia pymss od pymms przy pracy obok siebie) ---
 
-ACCENT_DARK = "#1F2D3D"   # granat - nagłówki tabel, pasek statusu
+#ACCENT_DARK = "#3B5068"   # stonowany granat - nagłówki tabel, pasek statusu
+ACCENT_DARK = "#2646CC"   # stonowany granat - nagłówki tabel, pasek statusu
 ACCENT = "#1E6FD0"        # niebieski - zaznaczenie, ramki, tytuły sekcji
 STATUS_COLORS = {"red": "#FF8A80", "green": "#8EE08E", "orange": "#FFC266"} # czytelne na granatowym pasku
 
@@ -1127,7 +1128,7 @@ QHeaderView::section {{
     font-weight: bold;
     padding: 4px;
     border: none;
-    border-right: 1px solid #3A4B5E;
+    border-right: 1px solid #546A84;
 }}
 QTableWidget {{
     gridline-color: #D0D7E0;
@@ -1146,7 +1147,7 @@ QStatusBar QLabel {{
 
 class ModbusSlaveApp(QMainWindow):
     # Wersja aplikacji, która będzie inkrementowana
-    __version__ = "1.02"
+    __version__ = "1.03"
 
     # Kolumny tabeli rejestrów
     COL_TABLE, COL_ADDR, COL_ADDR_HEX, COL_TYPE, COL_ORDER, COL_RAW, COL_VALUE, COL_DESC = range(8)
