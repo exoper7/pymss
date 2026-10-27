@@ -1,12 +1,15 @@
-table;address;data_type;byte_order;value;description
-coil;0;BOOL;ABCD;True;Pump 1 run command
-coil;1;BOOL;ABCD;False;Pump 2 run command
-discrete_input;0;BOOL;ABCD;True;Pump 1 running
-discrete_input;1;BOOL;ABCD;False;Alarm active
-input_register;0;INT16;ABCD;215;Temperature x10 [C]
-input_register;1;FLOAT32;ABCD;3.14159;Flow [m3/h]
-input_register;3;UINT32;CDAB;123456;Energy counter [kWh]
-holding_register;0;UINT16;ABCD;1500;Speed setpoint [rpm]
-holding_register;1;FLOAT32;CDAB;50.5;Pressure setpoint [bar]
-holding_register;3;FLOAT64;ABCD;2.718281828459045;Calibration factor
-holding_register;7;INT64;ABCD;-9000000000;Total volume
+slave_id;table;address;data_type;byte_order;value;description
+1;coil;0;BOOL;ABCD;True;Pump 1 run command
+1;coil;1;BOOL;ABCD;False;Pump 2 run command
+1;discrete_input;0;BOOL;ABCD;True;Pump 1 running
+1;discrete_input;1;BOOL;ABCD;False;Alarm active
+1;input_register;0;INT16;ABCD;215;Temperature x10 [C]
+1;input_register;1;FLOAT32;ABCD;3.14159;Flow [m3/h]
+1;input_register;3;UINT32;CDAB;123456;Energy counter [kWh]
+1;holding_register;0;UINT16;ABCD;1500;Speed setpoint [rpm]
+1;holding_register;1;FLOAT32;CDAB;50.5;Pressure setpoint [bar]
+1;holding_register;3;FLOAT64;ABCD;2.718281828459045;Calibration factor
+1;holding_register;7;INT64;ABCD;-9000000000;Total volume
+2;input_register;0;FLOAT32;CDAB;230.4;Meter 2 - voltage L1 [V]
+2;input_register;2;FLOAT32;CDAB;12.75;Meter 2 - current L1 [A]
+2;holding_register;0;UINT16;ABCD;9600;Meter 2 - baud rate

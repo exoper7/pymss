@@ -229,6 +229,7 @@ class RegisterDef:
     dtype: str          # BOOL / UINT16 / ... / FLOAT64
     order: str = "ABCD"
     description: str = ""
+    slave_id: int = 1   # urządzenie (Unit ID), do którego należy rejestr
 
     @property
     def count(self):
@@ -240,21 +241,34 @@ class RegisterDef:
 
 
 class DataStore:
-    """Pamięć slave'a (thread-safe). Definicje rejestrów są widokami na surową pamięć."""
+    """Pamięć symulowanych urządzeń (thread-safe). Definicje rejestrów są widokami na surową pamięć.
+    Każde urządzenie (Slave ID) ma osobną pamięć - umożliwia symulację wielu urządzeń na jednej magistrali."""
     def __init__(self):
         self.lock = threading.RLock()
-        self.mem = {t: {} for t in TABLE_ORDER}
+        self.mem = {}       # (slave, tabela) -> {adres: wartość}
         self.defs = []
+        self.default_slave = 1 # urządzenie domyślne - odpowiada zawsze, nawet bez zdefiniowanych rejestrów
         self.undefined_mode = "zeros" # klucz z UNDEFINED_MODES
-        self.written = {}   # (tabela, adres) -> czas ostatniego zapisu przez mastera
+        self.written = {}   # (slave, tabela, adres) -> czas ostatniego zapisu przez mastera
         self.dirty = False
+
+    def _mem(self, slave, table):
+        return self.mem.setdefault((slave, table), {})
+
+    def device_ids(self):
+        """Urządzenia obsługiwane przez symulator: Slave ID z mapy rejestrów + urządzenie domyślne."""
+        with self.lock:
+            return sorted({d.slave_id for d in self.defs} | {self.default_slave})
+
+    def device(self, slave):
+        return DeviceMemory(self, slave)
 
     # --- Zarządzanie definicjami (GUI) ---
 
     def find_overlap(self, new, ignore=None):
         with self.lock:
             for d in self.defs:
-                if d is ignore or d.table != new.table:
+                if d is ignore or d.table != new.table or d.slave_id != new.slave_id:
                     continue
                 if d.address < new.address + new.count and new.address < d.address + d.count:
                     return d
@@ -271,18 +285,19 @@ class DataStore:
         words = self._encode(d, value)
         conflict = self.find_overlap(d)
         if conflict:
-            raise ValueError(f"{TABLES[d.table]} {d.address} overlaps with existing definition at address {conflict.address} ({conflict.dtype})")
-        mem = self.mem[d.table]
+            raise ValueError(f"Slave {d.slave_id} {TABLES[d.table]} {d.address} overlaps with existing definition "
+                             f"at address {conflict.address} ({conflict.dtype})")
+        mem = self._mem(d.slave_id, d.table)
         for i, w in enumerate(words):
             mem[d.address + i] = w
         self.defs.append(d)
-        self.defs.sort(key=lambda x: (TABLE_ORDER.index(x.table), x.address))
+        self.defs.sort(key=lambda x: (x.slave_id, TABLE_ORDER.index(x.table), x.address))
 
     def _remove(self, d):
-        mem = self.mem[d.table]
+        mem = self._mem(d.slave_id, d.table)
         for a in d.addresses:
             mem.pop(a, None)
-            self.written.pop((d.table, a), None)
+            self.written.pop((d.slave_id, d.table, a), None)
         self.defs = [x for x in self.defs if x is not d]
 
     def add_definition(self, d, value):
@@ -305,13 +320,13 @@ class DataStore:
 
     def clear(self):
         with self.lock:
-            self.mem = {t: {} for t in TABLE_ORDER}
+            self.mem = {}
             self.defs = []
             self.written = {}
 
     def get_value(self, d):
         with self.lock:
-            mem = self.mem[d.table]
+            mem = self._mem(d.slave_id, d.table)
             if d.table in BIT_TABLES:
                 return bool(mem.get(d.address, False))
             return registers_to_value(d.dtype, d.order, [mem.get(a, 0) for a in d.addresses])
@@ -319,82 +334,96 @@ class DataStore:
     def set_value(self, d, value):
         with self.lock:
             words = self._encode(d, value)
+            mem = self._mem(d.slave_id, d.table)
             for i, w in enumerate(words):
-                self.mem[d.table][d.address + i] = w
+                mem[d.address + i] = w
 
     def raw_text(self, d):
         with self.lock:
-            mem = self.mem[d.table]
+            mem = self._mem(d.slave_id, d.table)
             if d.table in BIT_TABLES:
                 return "1" if mem.get(d.address, False) else "0"
             return " ".join(f"0x{mem.get(a, 0):04X}" for a in d.addresses)
 
     def last_write_time(self, d):
         with self.lock:
-            return max(self.written.get((d.table, a), 0.0) for a in d.addresses)
+            return max(self.written.get((d.slave_id, d.table, a), 0.0) for a in d.addresses)
 
     def consume_dirty(self):
         with self.lock:
             dirty, self.dirty = self.dirty, False
             return dirty
 
-    # --- Dostęp z protokołu Modbus (wątki serwera) ---
+
+class DeviceMemory:
+    """Dostęp z protokołu Modbus (wątki serwera) do pamięci jednego urządzenia."""
+    def __init__(self, store, slave):
+        self.store = store
+        self.slave = slave
+        self.lock = store.lock
+
+    def _mem(self, table):
+        return self.store._mem(self.slave, table)
 
     def _check(self, table, address, count):
         if address + count > 65536:
             raise ModbusError(0x02)
-        if self.undefined_mode != "zeros":
-            mem = self.mem[table]
+        if self.store.undefined_mode != "zeros":
+            mem = self._mem(table)
             for a in range(address, address + count):
                 if a not in mem:
-                    if self.undefined_mode == "ignore":
+                    if self.store.undefined_mode == "ignore":
                         raise IgnoreRequest()
                     raise ModbusError(0x02)
 
     def _mark_written(self, table, address, count):
         now = time.monotonic()
         for a in range(address, address + count):
-            self.written[(table, a)] = now
-        self.dirty = True
+            self.store.written[(self.slave, table, a)] = now
+        self.store.dirty = True
 
     def read_bits(self, table, address, count):
         with self.lock:
             self._check(table, address, count)
-            mem = self.mem[table]
+            mem = self._mem(table)
             return [bool(mem.get(a, False)) for a in range(address, address + count)]
 
     def read_registers(self, table, address, count):
         with self.lock:
             self._check(table, address, count)
-            mem = self.mem[table]
+            mem = self._mem(table)
             return [mem.get(a, 0) for a in range(address, address + count)]
 
     def write_coils(self, address, values):
         with self.lock:
             self._check("CO", address, len(values))
+            mem = self._mem("CO")
             for i, v in enumerate(values):
-                self.mem["CO"][address + i] = bool(v)
+                mem[address + i] = bool(v)
             self._mark_written("CO", address, len(values))
 
     def write_registers(self, address, values):
         with self.lock:
             self._check("HR", address, len(values))
+            mem = self._mem("HR")
             for i, v in enumerate(values):
-                self.mem["HR"][address + i] = v & 0xFFFF
+                mem[address + i] = v & 0xFFFF
             self._mark_written("HR", address, len(values))
 
     def mask_write_register(self, address, and_mask, or_mask):
         with self.lock:
             self._check("HR", address, 1)
-            current = self.mem["HR"].get(address, 0)
-            self.mem["HR"][address] = (current & and_mask) | (or_mask & ~and_mask & 0xFFFF)
+            mem = self._mem("HR")
+            current = mem.get(address, 0)
+            mem[address] = (current & and_mask) | (or_mask & ~and_mask & 0xFFFF)
             self._mark_written("HR", address, 1)
 
 
 # --- Obsługa protokołu (PDU) ---
 
 def process_pdu(store, pdu):
-    """Przetwarza PDU zapytania i zwraca PDU odpowiedzi (normalnej lub wyjątku) albo None - brak odpowiedzi."""
+    """store - DeviceMemory urządzenia, do którego skierowano zapytanie.
+    Przetwarza PDU zapytania i zwraca PDU odpowiedzi (normalnej lub wyjątku) albo None - brak odpowiedzi."""
     fc = pdu[0]
     try:
         if fc in (0x01, 0x02):
@@ -544,11 +573,10 @@ def describe_pdu(pdu, is_request):
 # --- Serwery (TCP / RTU) ---
 
 class SlaveServerBase:
-    def __init__(self, store, log, slave_id=1, respond_all=False, delay_ms=0):
+    def __init__(self, store, log, respond_all=False, delay_ms=0):
         self.store = store
         self.log = log # log(kind, channel, data, text) - wywoływane z wątków roboczych
-        self.slave_id = slave_id
-        self.respond_all = respond_all
+        self.respond_all = respond_all # nieznany Unit ID obsługuje urządzenie domyślne
         self.delay_ms = delay_ms
         self.running = False
         self.thread = None
@@ -573,16 +601,23 @@ class SlaveServerBase:
             self.count("errors")
             self.log("ERROR", channel, b"", "Empty PDU - ignored")
             return None
-        if broadcast_allowed and unit == 0:
-            response = process_pdu(self.store, pdu)
-            self.log("INFO", channel, b"", "Broadcast (Unit ID 0) processed - no response sent"
-                     + (f" ({describe_pdu(response, False)})" if response and response[0] & 0x80 else ""))
+        devices = self.store.device_ids()
+        if broadcast_allowed and unit == 0: # broadcast - wykonują wszystkie urządzenia, bez odpowiedzi
+            for slave in devices:
+                process_pdu(self.store.device(slave), pdu)
+            self.log("INFO", channel, b"", f"Broadcast (Unit ID 0) processed by slave(s) {', '.join(map(str, devices))}"
+                     " - no response sent")
             return None
-        if unit != self.slave_id and not self.respond_all:
+        if unit in devices:
+            slave = unit
+        elif self.respond_all:
+            slave = self.store.default_slave
+        else:
             self.count("ignored")
-            self.log("INFO", channel, b"", f"Unit ID {unit} does not match slave ID {self.slave_id} - ignored")
+            self.log("INFO", channel, b"", f"Unit ID {unit} - no such device (simulated: "
+                     f"{', '.join(map(str, devices))}) - ignored")
             return None
-        response = process_pdu(self.store, pdu)
+        response = process_pdu(self.store.device(slave), pdu)
         if response is None:
             self.count("ignored")
             self.log("INFO", channel, b"", "Request refers to undefined registers - ignored (no response)")
@@ -950,7 +985,7 @@ class ModbusValueEditor(QDialog):
     """Dialog to edit register value."""
     def __init__(self, definition, current_value, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Edit {TABLES[definition.table]} {definition.address}")
+        self.setWindowTitle(f"Edit Slave {definition.slave_id} {TABLES[definition.table]} {definition.address}")
         self.setModal(True)
         self.definition = definition
         self.new_value = None
@@ -996,14 +1031,21 @@ class ModbusValueEditor(QDialog):
 
 class RegisterDefDialog(QDialog):
     """Dialog dodawania (wielu) lub edycji definicji rejestru."""
-    def __init__(self, parent=None, definition=None, value=None, default_table="HR", default_address=0):
+    def __init__(self, parent=None, definition=None, value=None, default_slave=1, default_table="HR",
+                 default_address=0, next_free_address=None):
         super().__init__(parent)
         self.edit_mode = definition is not None
+        self.next_free_address = next_free_address # (slave, tabela) -> pierwszy wolny adres (tryb dodawania)
         self.setWindowTitle("Edit Register Definition" if self.edit_mode else "Add Registers")
         self.setModal(True)
         self.result_data = None
 
         form = QFormLayout()
+        self.slave_sb = QSpinBox()
+        self.slave_sb.setRange(1, 247) # Modbus slave ID range
+        self.slave_sb.setValue(definition.slave_id if self.edit_mode else default_slave)
+        form.addRow("Slave ID:", self.slave_sb)
+
         self.table_cb = QComboBox()
         for code, label in TABLES.items():
             self.table_cb.addItem(label, code)
@@ -1048,6 +1090,8 @@ class RegisterDefDialog(QDialog):
             self.desc_le.setText(definition.description)
         else:
             self.address_sb.setValue(default_address)
+            self.slave_sb.valueChanged.connect(self.suggest_address)
+            self.table_cb.currentIndexChanged.connect(self.suggest_address)
         self.on_dtype_changed()
 
         layout = QVBoxLayout()
@@ -1082,6 +1126,11 @@ class RegisterDefDialog(QDialog):
         dtype = self.dtype_cb.currentData()
         self.order_cb.setEnabled(dtype is not None and register_count(dtype) > 1)
 
+    def suggest_address(self):
+        """Po zmianie urządzenia/tabeli podpowiada pierwszy wolny adres."""
+        if self.next_free_address:
+            self.address_sb.setValue(self.next_free_address(self.slave_sb.value(), self.table_cb.currentData()))
+
     def accept_values(self):
         table = self.table_cb.currentData()
         dtype = self.dtype_cb.currentData()
@@ -1094,7 +1143,7 @@ class RegisterDefDialog(QDialog):
             QMessageBox.warning(self, "Error", f"Invalid value: {e}")
             return
         self.result_data = {
-            "table": table, "address": self.address_sb.value(), "count": self.count_sb.value(),
+            "slave_id": self.slave_sb.value(), "table": table, "address": self.address_sb.value(), "count": self.count_sb.value(),
             "dtype": dtype, "order": order, "value": value, "description": self.desc_le.text().strip(),
         }
         self.accept()
@@ -1147,10 +1196,10 @@ QStatusBar QLabel {{
 
 class ModbusSlaveApp(QMainWindow):
     # Wersja aplikacji, która będzie inkrementowana
-    __version__ = "1.03"
+    __version__ = "1.04"
 
     # Kolumny tabeli rejestrów
-    COL_TABLE, COL_ADDR, COL_ADDR_HEX, COL_TYPE, COL_ORDER, COL_RAW, COL_VALUE, COL_DESC = range(8)
+    COL_SLAVE, COL_TABLE, COL_ADDR, COL_ADDR_HEX, COL_TYPE, COL_ORDER, COL_RAW, COL_VALUE, COL_DESC = range(9)
     HIGHLIGHT_SECONDS = 1.5 # Jak długo podświetlać rejestry zapisane przez mastera
 
     def __init__(self):
@@ -1264,14 +1313,18 @@ class ModbusSlaveApp(QMainWindow):
         slave_layout = QHBoxLayout()
         slave_group.setLayout(slave_layout)
 
-        slave_layout.addWidget(QLabel("Slave ID:"))
+        slave_layout.addWidget(QLabel("Default Slave ID:"))
         self.slave_id_sb = QSpinBox()
         self.slave_id_sb.setRange(1, 247) # Modbus slave ID range
         self.slave_id_sb.setValue(1)
+        self.slave_id_sb.setToolTip("Slave ID used for new registers and CSV rows without slave_id.\n"
+                                    "This device always responds, even without defined registers.\n"
+                                    "Other devices are created by assigning registers to other Slave IDs.")
         self.slave_id_sb.valueChanged.connect(self.apply_slave_settings)
         slave_layout.addWidget(self.slave_id_sb)
 
         self.respond_all_cb = QCheckBox("Respond to any Unit ID")
+        self.respond_all_cb.setToolTip("Requests to Unit IDs without a simulated device are served by the default slave")
         self.respond_all_cb.toggled.connect(self.apply_slave_settings)
         slave_layout.addWidget(self.respond_all_cb)
 
@@ -1323,6 +1376,12 @@ class ModbusSlaveApp(QMainWindow):
         self.export_btn.clicked.connect(self.export_csv)
         buttons_layout.addWidget(self.export_btn)
         buttons_layout.addStretch()
+        buttons_layout.addWidget(QLabel("Slave:"))
+        self.slave_filter_cb = QComboBox()
+        self.slave_filter_cb.setMinimumWidth(60)
+        self.slave_filter_cb.addItem("All", None)
+        self.slave_filter_cb.currentIndexChanged.connect(self.rebuild_table)
+        buttons_layout.addWidget(self.slave_filter_cb)
         buttons_layout.addWidget(QLabel("Show:"))
         self.filter_cb = QComboBox()
         self.filter_cb.addItem("All", None)
@@ -1333,16 +1392,16 @@ class ModbusSlaveApp(QMainWindow):
         registers_layout.addLayout(buttons_layout)
 
         self.registers_table = QTableWidget()
-        self.registers_table.setColumnCount(8)
+        self.registers_table.setColumnCount(9)
         self.registers_table.setHorizontalHeaderLabels([
-            "Table", "Address", "Address (HEX)", "Data Type", "Byte Order", "Raw Value (HEX/Bool)", "Value", "Description"
+            "Slave ID", "Table", "Address", "Address (HEX)", "Data Type", "Byte Order", "Raw Value (HEX/Bool)", "Value", "Description"
         ])
         self.registers_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.registers_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.registers_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.registers_table.verticalHeader().setVisible(False)
         self.registers_table.cellDoubleClicked.connect(self.on_table_double_click)
-        for col, width in enumerate([150, 70, 100, 80, 85, 190, 150]):
+        for col, width in enumerate([60, 155, 60, 95, 75, 80, 175, 140]):
             self.registers_table.setColumnWidth(col, width)
         self.registers_table.horizontalHeader().setStretchLastSection(True) # Last column stretches
         registers_layout.addWidget(self.registers_table)
@@ -1404,8 +1463,10 @@ class ModbusSlaveApp(QMainWindow):
     def apply_slave_settings(self):
         """Ustawienia slave'a można zmieniać w trakcie pracy serwera."""
         self.store.undefined_mode = self.undefined_mode_cb.currentData()
+        if self.store.default_slave != self.slave_id_sb.value():
+            self.store.default_slave = self.slave_id_sb.value()
+            self.update_slave_filter()
         if self.server:
-            self.server.slave_id = self.slave_id_sb.value()
             self.server.respond_all = self.respond_all_cb.isChecked()
             self.server.delay_ms = self.delay_sb.value()
 
@@ -1413,7 +1474,6 @@ class ModbusSlaveApp(QMainWindow):
         if self.server:
             return
         common = dict(
-            slave_id=self.slave_id_sb.value(),
             respond_all=self.respond_all_cb.isChecked(),
             delay_ms=self.delay_sb.value(),
         )
@@ -1437,13 +1497,15 @@ class ModbusSlaveApp(QMainWindow):
                     raise ValueError("TCP port must be in range 1-65535")
                 server = TcpSlaveServer(self.store, self.log_bus.log, host, port, **common)
             self.store.undefined_mode = self.undefined_mode_cb.currentData()
+            self.store.default_slave = self.slave_id_sb.value()
             server.start()
         except (OSError, ValueError, serial.SerialException) as e:
             self.set_status(f"Cannot start server: {e}", "red")
             self.log_bus.log("ERROR", self.connection_type, b"", f"Cannot start server: {e}")
             return
         self.server = server
-        self.set_status(f"Server running: {server.describe()}, slave ID {self.slave_id_sb.value()}.", "green")
+        devices = ", ".join(map(str, self.store.device_ids()))
+        self.set_status(f"Server running: {server.describe()}, slave ID(s): {devices}.", "green")
         self.update_server_buttons()
         self.update_status_bar_stats()
 
@@ -1464,15 +1526,34 @@ class ModbusSlaveApp(QMainWindow):
 
     # --- Tabela rejestrów ---
 
+    def update_slave_filter(self):
+        """Odświeża listę urządzeń w filtrze 'Slave', zachowując bieżący wybór."""
+        current = self.slave_filter_cb.currentData()
+        self.slave_filter_cb.blockSignals(True)
+        self.slave_filter_cb.clear()
+        self.slave_filter_cb.addItem("All", None)
+        for slave in self.store.device_ids():
+            self.slave_filter_cb.addItem(str(slave), slave)
+        index = self.slave_filter_cb.findData(current)
+        self.slave_filter_cb.setCurrentIndex(index if index >= 0 else 0)
+        self.slave_filter_cb.blockSignals(False)
+        if index < 0 and current is not None: # wybrane urządzenie zniknęło - pokaż wszystkie
+            self.rebuild_table()
+
     def rebuild_table(self):
         """Pełna przebudowa tabeli po zmianie definicji lub filtra."""
+        self.update_slave_filter()
         table_filter = self.filter_cb.currentData()
+        slave_filter = self.slave_filter_cb.currentData()
         with self.store.lock:
-            self.visible_defs = [d for d in self.store.defs if table_filter is None or d.table == table_filter]
+            self.visible_defs = [d for d in self.store.defs
+                                 if (table_filter is None or d.table == table_filter)
+                                 and (slave_filter is None or d.slave_id == slave_filter)]
         self.highlighted_rows = set()
         self.registers_table.setRowCount(len(self.visible_defs))
         for row, d in enumerate(self.visible_defs):
             items = [
+                str(d.slave_id),
                 TABLES[d.table],
                 str(d.address),
                 f"0x{d.address:04X}",
@@ -1516,7 +1597,7 @@ class ModbusSlaveApp(QMainWindow):
         self.update_status_bar_stats()
 
     def update_status_bar_stats(self):
-        text = f"Registers: {len(self.store.defs)}"
+        text = f"Slave ID(s): {', '.join(map(str, self.store.device_ids()))} | Registers: {len(self.store.defs)}"
         if self.server:
             s = self.server.get_stats()
             text += (f" | Requests: {s['requests']} | Responses: {s['responses']}"
@@ -1529,22 +1610,29 @@ class ModbusSlaveApp(QMainWindow):
         rows = sorted({index.row() for index in self.registers_table.selectionModel().selectedRows()})
         return [self.visible_defs[r] for r in rows if r < len(self.visible_defs)]
 
-    def next_free_address(self, table):
+    def next_free_address(self, slave, table):
         with self.store.lock:
-            ends = [d.address + d.count for d in self.store.defs if d.table == table]
+            ends = [d.address + d.count for d in self.store.defs if d.table == table and d.slave_id == slave]
         return min(max(ends, default=0), 65535)
 
     def add_registers(self):
         selected = self.selected_defs()
-        table = selected[-1].table if selected else (self.filter_cb.currentData() or "HR")
-        dialog = RegisterDefDialog(self, default_table=table, default_address=self.next_free_address(table))
+        if selected:
+            slave, table = selected[-1].slave_id, selected[-1].table
+        else:
+            slave = self.slave_filter_cb.currentData() or self.store.default_slave
+            table = self.filter_cb.currentData() or "HR"
+        dialog = RegisterDefDialog(self, default_slave=slave, default_table=table,
+                                   default_address=self.next_free_address(slave, table),
+                                   next_free_address=self.next_free_address)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         r = dialog.result_data
         width = register_count(r["dtype"])
         added, errors = 0, []
         for i in range(r["count"]):
-            d = RegisterDef(r["table"], r["address"] + i * width, r["dtype"], r["order"], r["description"])
+            d = RegisterDef(r["table"], r["address"] + i * width, r["dtype"], r["order"], r["description"],
+                            slave_id=r["slave_id"])
             try:
                 self.store.add_definition(d, r["value"])
                 added += 1
@@ -1563,14 +1651,14 @@ class ModbusSlaveApp(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         r = dialog.result_data
-        new = RegisterDef(r["table"], r["address"], r["dtype"], r["order"], r["description"])
+        new = RegisterDef(r["table"], r["address"], r["dtype"], r["order"], r["description"], slave_id=r["slave_id"])
         try:
             self.store.replace_definition(d, new, r["value"])
         except ValueError as e:
             QMessageBox.warning(self, "Edit Register", str(e))
             return
         self.rebuild_table()
-        self.set_status(f"Updated {TABLES[new.table]} {new.address}.")
+        self.set_status(f"Updated slave {new.slave_id} {TABLES[new.table]} {new.address}.")
 
     def edit_selected(self):
         selected = self.selected_defs()
@@ -1588,7 +1676,7 @@ class ModbusSlaveApp(QMainWindow):
                 QMessageBox.warning(self, "Error", str(e))
                 return
             self.refresh_values()
-            self.set_status(f"{TABLES[d.table]} {d.address} = {format_value(d.dtype, dialog.new_value)}")
+            self.set_status(f"Slave {d.slave_id} {TABLES[d.table]} {d.address} = {format_value(d.dtype, dialog.new_value)}")
 
     def on_table_double_click(self, row, column):
         """Podwójne kliknięcie na wartości - edycja wartości, w pozostałych kolumnach - edycja definicji."""
@@ -1618,10 +1706,11 @@ class ModbusSlaveApp(QMainWindow):
         self.set_status("Register map cleared.")
 
     # --- Import / eksport CSV ---
-    # Format: table;address;data_type;byte_order;value;description
+    # Format: slave_id;table;address;data_type;byte_order;value;description
     # Import automatycznie rozpoznaje separator (',' ';' lub tab) i akceptuje przecinek dziesiętny.
+    # Kolumna slave_id jest opcjonalna - brak oznacza domyślny Slave ID.
 
-    CSV_COLUMNS = ["table", "address", "data_type", "byte_order", "value", "description"]
+    CSV_COLUMNS = ["slave_id", "table", "address", "data_type", "byte_order", "value", "description"]
 
     def export_csv(self):
         if not self.store.defs:
@@ -1633,7 +1722,7 @@ class ModbusSlaveApp(QMainWindow):
             return
         try:
             with self.store.lock:
-                rows = [[TABLE_CSV_NAMES[d.table], d.address, d.dtype, d.order,
+                rows = [[d.slave_id, TABLE_CSV_NAMES[d.table], d.address, d.dtype, d.order,
                          format_value(d.dtype, self.store.get_value(d)), d.description] for d in self.store.defs]
             with open(path, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f, delimiter=";")
@@ -1645,7 +1734,7 @@ class ModbusSlaveApp(QMainWindow):
         self.set_status(f"Exported {len(rows)} register(s) to {path}")
 
     @staticmethod
-    def parse_csv_rows(text):
+    def parse_csv_rows(text, default_slave=1):
         """Zwraca (lista (RegisterDef, wartość, nr_linii), lista błędów)."""
         try:
             delimiter = csv.Sniffer().sniff(text.split("\n", 1)[0], delimiters=",;\t").delimiter
@@ -1669,6 +1758,10 @@ class ModbusSlaveApp(QMainWindow):
             if not any(c.strip() for c in row) or row[0].strip().startswith("#"):
                 continue
             try:
+                slave_text = cell(row, "slave_id")
+                slave = parse_value("UINT16", slave_text) if slave_text else default_slave
+                if not 1 <= slave <= 247:
+                    raise ValueError(f"slave_id {slave} out of range 1-247")
                 table = TABLE_ALIASES.get(cell(row, "table").lower())
                 if table is None:
                     raise ValueError(f"unknown table '{cell(row, 'table')}'")
@@ -1691,7 +1784,8 @@ class ModbusSlaveApp(QMainWindow):
                 value = parse_value(dtype, cell(row, "value"))
                 if dtype != "BOOL":
                     value_to_registers(dtype, order, value)
-                result.append((RegisterDef(table, address, dtype, order, cell(row, "description")), value, line_no))
+                result.append((RegisterDef(table, address, dtype, order, cell(row, "description"), slave_id=slave),
+                               value, line_no))
             except ValueError as e:
                 errors.append(f"Line {line_no}: {e}")
         return result, errors
@@ -1711,7 +1805,7 @@ class ModbusSlaveApp(QMainWindow):
             QMessageBox.critical(self, "Import CSV", f"Cannot read file: {e}")
             return
 
-        parsed, errors = self.parse_csv_rows(text)
+        parsed, errors = self.parse_csv_rows(text, self.store.default_slave)
         if not parsed and errors:
             QMessageBox.warning(self, "Import CSV", "Nothing imported:\n\n" + "\n".join(errors[:20]))
             return
