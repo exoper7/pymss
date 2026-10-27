@@ -1,0 +1,12 @@
+table;address;data_type;byte_order;value;description
+coil;0;BOOL;ABCD;True;Pump 1 run command
+coil;1;BOOL;ABCD;False;Pump 2 run command
+discrete_input;0;BOOL;ABCD;True;Pump 1 running
+discrete_input;1;BOOL;ABCD;False;Alarm active
+input_register;0;INT16;ABCD;215;Temperature x10 [C]
+input_register;1;FLOAT32;ABCD;3.14159;Flow [m3/h]
+input_register;3;UINT32;CDAB;123456;Energy counter [kWh]
+holding_register;0;UINT16;ABCD;1500;Speed setpoint [rpm]
+holding_register;1;FLOAT32;CDAB;50.5;Pressure setpoint [bar]
+holding_register;3;FLOAT64;ABCD;2.718281828459045;Calibration factor
+holding_register;7;INT64;ABCD;-9000000000;Total volume
